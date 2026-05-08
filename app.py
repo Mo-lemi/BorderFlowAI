@@ -5,6 +5,7 @@ Streamlit app with Gemini Vision, ElevenLabs TTS, and Solana proof-of-cargo.
 
 import streamlit as st
 from google import genai
+from google.genai import types
 from PIL import Image, ExifTags
 import httpx
 import hashlib
