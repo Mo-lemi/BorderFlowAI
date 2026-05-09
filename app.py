@@ -375,7 +375,7 @@ CONFIDENCE SCORE: [1-10]
 RECOMMENDED ACTION: [PROCEED TO LANE / SECONDARY INSPECTION / DETAIN FOR INVESTIGATION]
 """
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.0-flash-lite",
         contents=[prompt, image],
     )
     return response.text or "No response from Gemini."
