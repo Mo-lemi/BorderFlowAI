@@ -1,3 +1,6 @@
 streamlit
-google-generativeai
+google-genai
+httpx
 Pillow
+base58
+solders
