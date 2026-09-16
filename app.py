@@ -6,6 +6,8 @@ Streamlit app with Gemini Vision, ElevenLabs TTS, and Solana proof-of-cargo.
 import streamlit as st
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field, ValidationError
+from typing import Literal
 from PIL import Image, ExifTags
 import httpx
 import hashlib
@@ -14,6 +16,32 @@ import re
 import base64
 # import asyncio
 from datetime import datetime
+
+# ─────────────────────────────────────────────
+# GEMINI AUDIT SCHEMA
+# ─────────────────────────────────────────────
+
+class ForensicAudit(BaseModel):
+    extracted_data: dict[str, str] = Field(
+        description="Every field legible on the document image, as key/value pairs"
+    )
+    discrepancies: list[str] = Field(
+        description="Each specific mismatch between the declaration and the document. Empty list if none."
+    )
+    forensic_observations: str = Field(
+        description="Document integrity assessment: tampering indicators, metadata analysis"
+    )
+    physical_logic_assessment: str = Field(
+        description="Whether the declared weight is physically plausible for the declared commodity"
+    )
+    regulatory_compliance: str = Field(
+        description="Whether the permit class matches the cargo type"
+    )
+    confidence_score: int = Field(ge=1, le=10)
+    recommended_action: Literal[
+        "PROCEED_TO_LANE", "SECONDARY_INSPECTION", "DETAIN_FOR_INVESTIGATION"
+    ]
+
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -285,6 +313,38 @@ def validate_weight(weight: float) -> tuple[str, str]:
     return "PASS", f"{weight:,.0f} kg within legal limits"
 
 
+def compute_verdict(
+    audit: ForensicAudit,
+    id_ok: bool,
+    permit_ok: bool,
+    weight_severity: str,   # "PASS" | "WARN" | "FAIL"
+    route_ok: bool,
+    exif_ok: bool,
+) -> str:
+    """Returns 'CLEARED', 'WARNING', or 'FRAUD ALERT'. This function — not
+    Gemini — owns the verdict."""
+    if (
+        not id_ok
+        or (len(audit.discrepancies) > 0 and audit.confidence_score <= 4)
+        or audit.recommended_action == "DETAIN_FOR_INVESTIGATION"
+        or weight_severity == "FAIL"
+    ):
+        return "FRAUD ALERT"
+
+    if (
+        len(audit.discrepancies) > 0
+        or not permit_ok
+        or not route_ok
+        or not exif_ok
+        or weight_severity == "WARN"
+        or audit.recommended_action == "SECONDARY_INSPECTION"
+        or audit.confidence_score <= 6
+    ):
+        return "WARNING"
+
+    return "CLEARED"
+
+
 def generate_hash(data: dict) -> str:
     raw = json.dumps(data, sort_keys=True)
     return "0x" + hashlib.sha256(raw.encode()).hexdigest().upper()
@@ -296,6 +356,10 @@ def extract_exif(img: Image.Image) -> str:
         return "No EXIF metadata found — possible screenshot or synthetic image"
     readable = {ExifTags.TAGS.get(t, t): v for t, v in exif.items() if t in ExifTags.TAGS}
     return json.dumps(readable, default=str)[:800]
+
+
+def exif_present(metadata_str: str) -> bool:
+    return "No EXIF" not in metadata_str
 
 
 def build_audio_script(status: str, doc_ref: str, reason: str = "") -> str:
@@ -325,7 +389,7 @@ def build_audio_script(status: str, doc_ref: str, reason: str = "") -> str:
 
 def call_gemini_audit(declaration: str, image: Image.Image, metadata: str,
                       vehicle_reg: str, border: str, cargo: str,
-                      weight: float, permit: str, dest: str) -> str:
+                      weight: float, permit: str, dest: str) -> ForensicAudit:
     """Full multimodal forensic audit via Gemini Vision."""
     prompt = f"""ACT AS: A South African BMA Forensic Customs Auditor.
 
@@ -351,34 +415,19 @@ YOUR FORENSIC TASK — analyze the uploaded manifest/document image and:
    - EXIF metadata anomalies (stripped metadata suggests screenshot/synthetic)
    - Mismatched ink colors or printing inconsistencies
 5. REGULATORY CHECK: Does the permit class match the cargo type under SARS/BMA 2024 rules?
-
-OUTPUT FORMAT (use exactly this structure):
-AUDIT STATUS: [CLEARED / WARNING / FRAUD ALERT]
-
-EXTRACTED DOCUMENT DATA:
-[List every field you can read from the image]
-
-DISCREPANCIES FOUND:
-[List each specific mismatch between declaration and document, or NONE]
-
-FORENSIC OBSERVATIONS:
-[Document integrity assessment — tampering indicators, metadata analysis]
-
-PHYSICAL LOGIC ASSESSMENT:
-[Weight/commodity plausibility check]
-
-REGULATORY COMPLIANCE:
-[Permit class vs cargo type per BMA/SARS rules]
-
-CONFIDENCE SCORE: [1-10]
-
-RECOMMENDED ACTION: [PROCEED TO LANE / SECONDARY INSPECTION / DETAIN FOR INVESTIGATION]
 """
     response = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=[prompt, image],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ForensicAudit,
+        ),
     )
-    return response.text or "No response from Gemini."
+    try:
+        return ForensicAudit.model_validate_json(response.text)
+    except ValidationError as e:
+        raise RuntimeError("Gemini returned malformed audit data") from e
 
 
 def call_elevenlabs(script: str) -> bytes | None:
@@ -696,7 +745,7 @@ elif st.session_state.step == 3:
     if st.session_state.audit_result is None:
         with st.spinner("🔬 Gemini is auditing the chain of custody..."):
             try:
-                result = call_gemini_audit(
+                audit = call_gemini_audit(
                     declaration=st.session_state.declaration,
                     image=st.session_state.image_obj,
                     metadata=st.session_state.metadata_str,
@@ -707,19 +756,26 @@ elif st.session_state.step == 3:
                     permit=st.session_state.permit_no,
                     dest=st.session_state.dest_country
                 )
-                st.session_state.audit_result = result
+                st.session_state.audit_result = audit
             except Exception as e:
                 st.error(f"Gemini audit failed: {e}")
                 st.stop()
 
-        # Extract status from Gemini response
-        result_text = st.session_state.audit_result
-        if "FRAUD ALERT" in result_text:
-            verdict = "FRAUD ALERT"
-        elif "WARNING" in result_text:
-            verdict = "WARNING"
-        else:
-            verdict = "CLEARED"
+        # Rule-based checks feed the verdict alongside Gemini's findings
+        id_ok, _ = luhn_check(st.session_state.driver_id)
+        permit_ok, _ = validate_permit(st.session_state.permit_no, st.session_state.cargo_type)
+        weight_severity, _ = validate_weight(st.session_state.weight_kg)
+        route_ok, _ = validate_route(st.session_state.border_post, st.session_state.dest_country)
+        exif_ok = exif_present(st.session_state.metadata_str)
+
+        verdict = compute_verdict(
+            audit=audit,
+            id_ok=id_ok,
+            permit_ok=permit_ok,
+            weight_severity=weight_severity,
+            route_ok=route_ok,
+            exif_ok=exif_ok,
+        )
 
         # Build doc hash
         timestamp = datetime.utcnow().isoformat() + "Z"
@@ -740,14 +796,7 @@ elif st.session_state.step == 3:
         st.session_state.verdict = verdict
 
         # Generate audio script
-        # Pull first discrepancy/reason from audit text if flagged
-        reason = ""
-        if verdict != "CLEARED":
-            lines = result_text.split("\n")
-            for line in lines:
-                if "DISCREPAN" in line.upper() or "MISMATCH" in line.upper():
-                    reason = line.strip()[:120]
-                    break
+        reason = "; ".join(audit.discrepancies)[:120] if verdict != "CLEARED" else ""
         audio_script = build_audio_script(verdict, doc_ref, reason)
         st.session_state.audio_script = audio_script
 
@@ -778,7 +827,7 @@ elif st.session_state.step == 4:
     doc_ref = st.session_state.get("doc_ref", "BF-UNKNOWN")
     doc_hash = st.session_state.get("doc_hash", "")
     timestamp = st.session_state.get("timestamp", "")
-    audit_text = st.session_state.get("audit_result", "")
+    audit: ForensicAudit = st.session_state.get("audit_result")
     ledger = st.session_state.get("ledger_result", {})
     audio_bytes = st.session_state.get("audio_bytes")
 
@@ -822,56 +871,38 @@ elif st.session_state.step == 4:
 
     with col1:
         st.markdown("#### 📋 Gemini Forensic Report")
-        # Parse and display formatted sections
-        sections = {
-            "EXTRACTED DOCUMENT DATA": "📄",
-            "DISCREPANCIES FOUND": "🔍",
-            "FORENSIC OBSERVATIONS": "🧬",
-            "PHYSICAL LOGIC ASSESSMENT": "⚖️",
-            "REGULATORY COMPLIANCE": "📜",
-        }
-
-        current_section = None
-        section_content = {}
-        status_line = ""
-        confidence = ""
-        action = ""
-
-        for line in audit_text.split("\n"):
-            if line.startswith("AUDIT STATUS:"):
-                status_line = line
-            elif line.startswith("CONFIDENCE SCORE:"):
-                confidence = line
-            elif line.startswith("RECOMMENDED ACTION:"):
-                action = line
-            else:
-                for sec in sections:
-                    if line.startswith(sec):
-                        current_section = sec
-                        section_content[sec] = []
-                        break
-                else:
-                    if current_section and line.strip():
-                        section_content[current_section].append(line)
 
         # Show metrics row
         m1, m2, m3 = st.columns(3)
         with m1:
             st.metric("Audit Status", verdict)
         with m2:
-            conf_val = confidence.replace("CONFIDENCE SCORE:", "").strip()
-            st.metric("Confidence", conf_val if conf_val else "—")
+            st.metric("Confidence", f"{audit.confidence_score}/10")
         with m3:
-            act_val = action.replace("RECOMMENDED ACTION:", "").strip()
-            st.metric("Action", act_val[:20] if act_val else "—")
+            st.metric("Action", audit.recommended_action.replace("_", " ").title()[:20])
 
-        for sec, emoji in sections.items():
-            content = section_content.get(sec, [])
-            if content:
-                with st.expander(f"{emoji} {sec.title()}", expanded=(sec == "DISCREPANCIES FOUND")):
-                    for line in content:
-                        if line.strip():
-                            st.markdown(line)
+        with st.expander("📄 Extracted Document Data"):
+            if audit.extracted_data:
+                for key, value in audit.extracted_data.items():
+                    st.markdown(f"- **{key}:** {value}")
+            else:
+                st.markdown("No fields extracted.")
+
+        with st.expander("🔍 Discrepancies Found", expanded=bool(audit.discrepancies)):
+            if audit.discrepancies:
+                for item in audit.discrepancies:
+                    st.markdown(f"- {item}")
+            else:
+                st.markdown("None found.")
+
+        with st.expander("🧬 Forensic Observations"):
+            st.markdown(audit.forensic_observations)
+
+        with st.expander("⚖️ Physical Logic Assessment"):
+            st.markdown(audit.physical_logic_assessment)
+
+        with st.expander("📜 Regulatory Compliance"):
+            st.markdown(audit.regulatory_compliance)
 
     with col2:
         # Rule-based checks
@@ -890,7 +921,7 @@ elif st.session_state.step == 4:
         r_ok, r_msg = validate_route(st.session_state.border_post, st.session_state.dest_country)
         st.markdown(f"{'✅' if r_ok else '❌'} **Route** — {r_msg[:50]}")
 
-        exif_ok = "No EXIF" not in st.session_state.metadata_str
+        exif_ok = exif_present(st.session_state.metadata_str)
         st.markdown(f"{'✅' if exif_ok else '⚠️'} **EXIF** — {'Original metadata present' if exif_ok else 'No metadata — possible screenshot'}")
 
         st.divider()
@@ -939,7 +970,7 @@ elif st.session_state.step == 4:
                     "solana_payload": solana_payload,
                     "ledger": ledger,
                     "audio_script": st.session_state.get("audio_script", ""),
-                    "gemini_audit": audit_text,
+                    "gemini_audit": audit.model_dump(),
                     "rule_checks": {
                         "sa_id": {"passed": id_ok, "detail": id_msg},
                         "permit": {"passed": p_ok, "detail": p_msg},

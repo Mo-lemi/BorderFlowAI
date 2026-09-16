@@ -4,3 +4,4 @@ httpx
 Pillow
 base58
 solders
+pydantic
