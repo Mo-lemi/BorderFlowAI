@@ -48,7 +48,9 @@ def build_reason(
     discrepancies: list[str],
 ) -> str:
     """Short human-readable reason from failed rule checks plus Gemini's
-    discrepancies, capped at ~120 characters for the audio script."""
+    discrepancies, capped at 120 characters for the audio script. Truncates
+    at a "; " clause boundary where possible, and at a word boundary
+    otherwise — never mid-word."""
     reasons = []
     if not id_ok:
         reasons.append("driver ID failed the checksum")
@@ -62,8 +64,33 @@ def build_reason(
         reasons.append("route does not match the border post")
     if not exif_ok:
         reasons.append("document image has no original metadata")
-    reasons.extend(discrepancies)
-    return "; ".join(reasons)[:120]
+    reasons.extend(d.rstrip(".") for d in discrepancies)
+
+    if not reasons:
+        return ""
+
+    full = "; ".join(reasons)
+    if len(full) <= 120:
+        return full
+
+    kept = []
+    length = 0
+    for clause in reasons:
+        candidate_length = len(clause) if not kept else length + 2 + len(clause)
+        if candidate_length > 120:
+            break
+        kept.append(clause)
+        length = candidate_length
+
+    if kept:
+        return "; ".join(kept)
+
+    # Even the first clause alone is too long — cut at the last word
+    # boundary within the limit, never mid-word.
+    first = reasons[0][:120]
+    if " " in first:
+        first = first[:first.rfind(" ")]
+    return first
 
 
 def _format_reason(reason: str) -> str:

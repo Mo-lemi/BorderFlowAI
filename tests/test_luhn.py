@@ -81,3 +81,12 @@ def test_age_81_is_rejected_as_too_old():
     ok, message = luhn_check(_id_for_age(81))
     assert ok is False
     assert "anomalous" in message
+
+
+def test_century_pivot_uses_current_year_not_a_hardcoded_one():
+    # A person born this year (age 0) must resolve to the current century.
+    # The old hardcoded `yy >= 24` pivot would misread this as 1900s + yy,
+    # reporting an age around 100 instead of 0.
+    ok, message = luhn_check(_id_for_age(0))
+    assert ok is False
+    assert "age 0" in message

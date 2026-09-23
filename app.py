@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from models import ForensicAudit
 from validation import (
-    luhn_check, validate_permit, validate_weight, validate_route,
+    luhn_check, validate_permit, validate_weight, validate_route, validate_step1_required,
     compute_verdict, exif_present,
     generate_hash, hash_bytes, audit_findings_hash, extract_exif, build_reason, build_audio_script,
 )
@@ -269,6 +269,21 @@ st.divider()
 
 
 # ─────────────────────────────────────────────
+# FORM CONSTANTS
+# ─────────────────────────────────────────────
+
+BORDER_POSTS = [
+    "Beit Bridge (ZA/ZW)", "Lebombo (ZA/MZ)", "Kopfontein (ZA/BW)",
+    "Oshoek (ZA/SZ)", "Ficksburg (ZA/LS)", "Maseru Bridge (ZA/LS)", "Vioolsdrift (ZA/NA)",
+]
+
+CARGO_TYPES = [
+    "General Freight", "Perishables", "Hazardous Materials",
+    "Live Animals", "Fuel / Petroleum", "Electronics", "Pharmaceuticals",
+]
+
+
+# ─────────────────────────────────────────────
 # STEP 1 — DRIVER DECLARATION
 # ─────────────────────────────────────────────
 
@@ -297,19 +312,17 @@ if st.session_state.step == 1:
         )
 
     with col2:
-        border_post = st.selectbox("Border Post", [
-            "Beit Bridge (ZA/ZW)", "Lebombo (ZA/MZ)", "Kopfontein (ZA/BW)",
-            "Oshoek (ZA/SZ)", "Ficksburg (ZA/LS)", "Maseru Bridge (ZA/LS)", "Vioolsdrift (ZA/NA)"
-        ], index=["Beit Bridge (ZA/ZW)", "Lebombo (ZA/MZ)", "Kopfontein (ZA/BW)",
-                  "Oshoek (ZA/SZ)", "Ficksburg (ZA/LS)", "Maseru Bridge (ZA/LS)", "Vioolsdrift (ZA/NA)"
-                  ].index(st.session_state.border_post) if st.session_state.border_post in
-                          ["Beit Bridge (ZA/ZW)", "Lebombo (ZA/MZ)", "Kopfontein (ZA/BW)",
-                           "Oshoek (ZA/SZ)", "Ficksburg (ZA/LS)", "Maseru Bridge (ZA/LS)", "Vioolsdrift (ZA/NA)"] else 0)
+        border_post = st.selectbox(
+            "Border Post", BORDER_POSTS,
+            index=BORDER_POSTS.index(st.session_state.border_post)
+            if st.session_state.border_post in BORDER_POSTS else 0,
+        )
 
-        cargo_type = st.selectbox("Cargo Type", [
-            "General Freight", "Perishables", "Hazardous Materials",
-            "Live Animals", "Fuel / Petroleum", "Electronics", "Pharmaceuticals"
-        ])
+        cargo_type = st.selectbox(
+            "Cargo Type", CARGO_TYPES,
+            index=CARGO_TYPES.index(st.session_state.cargo_type)
+            if st.session_state.cargo_type in CARGO_TYPES else 0,
+        )
         dest_country = st.text_input("Destination Country Code", value=st.session_state.dest_country,
                                      placeholder="e.g. ZW, MZ, BW")
 
@@ -351,10 +364,17 @@ if st.session_state.step == 1:
     st.divider()
 
     if st.button("Next: Upload Document →", use_container_width=True):
-        if not declaration.strip():
-            st.error("Cargo declaration is required.")
-        elif not vehicle_reg.strip():
-            st.error("Vehicle registration is required.")
+        errors = validate_step1_required(
+            declaration=declaration,
+            vehicle_reg=vehicle_reg,
+            driver_id=driver_id,
+            permit_no=permit_no,
+            weight_kg=weight_kg,
+            dest_country=dest_country,
+        )
+        if errors:
+            for error in errors:
+                st.error(error)
         else:
             st.session_state.declaration = declaration.strip()
             st.session_state.vehicle_reg = vehicle_reg.strip()
@@ -395,7 +415,7 @@ elif st.session_state.step == 2:
             st.session_state.image_obj = image
             metadata = extract_exif(image)
             st.session_state.metadata_str = metadata
-            st.image(image, caption="Uploaded document", use_container_width=True)
+            st.image(image, caption="Uploaded document", width="stretch")
             st.code(f"SHA-256: {st.session_state.document_hash}", language=None)
 
     with col2:
@@ -662,9 +682,17 @@ elif st.session_state.step == 4:
         """, unsafe_allow_html=True)
 
         if ledger:
-            net_status = "🟢 ON-CHAIN" if ledger.get("success") else "🟡 SIMULATED"
+            confirmation = ledger.get("confirmation")
+            if confirmation in ("confirmed", "finalized"):
+                net_status = "🟢 CONFIRMED"
+            elif confirmation == "submitted_unconfirmed":
+                net_status = "🟡 SUBMITTED (UNCONFIRMED)"
+            elif confirmation == "failed":
+                net_status = "🔴 FAILED"
+            else:
+                net_status = "🟡 SIMULATED"
             st.markdown(f"**Network:** {ledger.get('network', 'devnet')} · {net_status}")
-            if ledger.get("explorer_url"):
+            if ledger.get("success") and ledger.get("explorer_url"):
                 st.markdown(f"[View on Solana Explorer ↗]({ledger['explorer_url']})")
             if ledger.get("note"):
                 st.caption(ledger["note"])

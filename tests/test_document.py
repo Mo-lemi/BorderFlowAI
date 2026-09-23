@@ -128,3 +128,48 @@ def test_warning_reason_is_capitalized_and_period_terminated():
 def test_fraud_alert_with_empty_reason_has_no_double_space():
     script = build_audio_script("FRAUD ALERT", "BF-TEST", "")
     assert "  " not in script
+
+
+def test_long_discrepancy_list_truncates_at_clause_boundary():
+    discrepancies = [
+        "declared weight does not match manifest weight by a wide margin",
+        "consignee name misspelled on document requiring verification",
+        "permit number transposed by two digits and is now suspect",
+        "destination on cargo document differs from stated destination",
+    ]
+    reason = build_reason(
+        id_ok=True, permit_ok=True, weight_severity="PASS",
+        route_ok=True, exif_ok=True, discrepancies=discrepancies,
+    )
+    assert len(reason) <= 120
+    kept_count = reason.count("; ") + 1 if reason else 0
+    assert reason == "; ".join(discrepancies[:kept_count])
+    if kept_count < len(discrepancies):
+        assert len("; ".join(discrepancies[:kept_count + 1])) > 120
+
+
+def test_discrepancy_trailing_period_is_stripped_before_joining():
+    reason = build_reason(
+        id_ok=True, permit_ok=True, weight_severity="PASS",
+        route_ok=True, exif_ok=True,
+        discrepancies=["weight mismatch of 200kg."],
+    )
+    assert reason == "weight mismatch of 200kg"
+
+
+def test_single_overlong_clause_is_cut_at_word_boundary_not_mid_word():
+    long_discrepancy = (
+        "the declared consignee name on the manifest does not match the "
+        "name printed on the bill of lading document which was uploaded "
+        "for cross reference purposes during this audit"
+    )
+    assert len(long_discrepancy) > 120  # sanity check on the fixture itself
+
+    reason = build_reason(
+        id_ok=True, permit_ok=True, weight_severity="PASS",
+        route_ok=True, exif_ok=True, discrepancies=[long_discrepancy],
+    )
+    assert len(reason) <= 120
+    assert not reason.endswith("…")
+    assert long_discrepancy.startswith(reason)
+    assert long_discrepancy[len(reason)] == " "

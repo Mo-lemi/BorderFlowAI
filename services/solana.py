@@ -2,6 +2,7 @@
 
 import base64
 import json
+import time
 
 import httpx
 import streamlit as st
@@ -11,9 +12,45 @@ SOLANA_KEY = st.secrets.get("SOLANA_PRIVATE_KEY", "")
 
 MEMO_PROGRAM = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 
+CONFIRM_TIMEOUT_S = 10.0
+CONFIRM_POLL_INTERVAL_S = 1.0
+
 
 def is_configured() -> bool:
     return bool(SOLANA_KEY)
+
+
+def _network_label() -> str:
+    rpc = SOLANA_RPC.lower()
+    if "devnet" in rpc:
+        return "devnet"
+    if "mainnet" in rpc:
+        return "mainnet"
+    return "custom"
+
+
+def _poll_confirmation(signature: str) -> str:
+    """Poll getSignatureStatuses for up to CONFIRM_TIMEOUT_S seconds.
+
+    Returns "confirmed", "finalized", "failed" (status carries an err), or
+    "submitted_unconfirmed" if the poll window elapses with no status yet.
+    """
+    deadline = time.monotonic() + CONFIRM_TIMEOUT_S
+    while time.monotonic() < deadline:
+        resp = httpx.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}]
+        }, timeout=15.0)
+        value = resp.json().get("result", {}).get("value", [None])[0]
+        if value:
+            if value.get("err"):
+                return "failed"
+            status = value.get("confirmationStatus")
+            if status in ("confirmed", "finalized"):
+                return status
+        time.sleep(CONFIRM_POLL_INTERVAL_S)
+    return "submitted_unconfirmed"
 
 
 def record_solana(document_hash: str, audit_hash: str, alg: str, status: str, doc_ref: str, timestamp: str) -> dict:
@@ -23,14 +60,14 @@ def record_solana(document_hash: str, audit_hash: str, alg: str, status: str, do
         "ref": doc_ref, "doc": document_hash, "audit": audit_hash, "alg": alg,
         "status": status, "ts": timestamp
     }, separators=(",", ":"))
+    network = _network_label()
 
     if not SOLANA_KEY:
-        fake_sig = "BF" + audit_hash.removeprefix("0x")[:16] + "DevnetDemo"
         return {
             "success": False, "simulated": True,
-            "signature": fake_sig,
-            "explorer_url": f"https://explorer.solana.com/tx/{fake_sig}?cluster=devnet",
-            "memo": memo, "note": "Set SOLANA_PRIVATE_KEY in secrets.toml for real on-chain recording"
+            "signature": None, "explorer_url": None,
+            "network": network, "memo": memo,
+            "note": "Set SOLANA_PRIVATE_KEY in secrets.toml for real on-chain recording",
         }
 
     try:
@@ -71,16 +108,26 @@ def record_solana(document_hash: str, audit_hash: str, alg: str, status: str, do
             raise Exception(result["error"]["message"])
 
         sig = result["result"]
+        confirmation = _poll_confirmation(sig)
+
         cluster = "" if "mainnet" in SOLANA_RPC else "?cluster=devnet"
         return {
-            "success": True, "simulated": False,
+            "success": confirmation in ("confirmed", "finalized"),
+            "simulated": False,
             "signature": sig,
             "explorer_url": f"https://explorer.solana.com/tx/{sig}{cluster}",
-            "memo": memo
+            "network": network,
+            "confirmation": confirmation,
+            "memo": memo,
         }
 
     except ImportError:
         return {"success": False, "simulated": True,
+                "signature": None, "explorer_url": None,
+                "network": network,
                 "error": "Run: pip install solders", "memo": memo}
     except Exception as e:
-        return {"success": False, "simulated": True, "error": str(e), "memo": memo}
+        return {"success": False, "simulated": True,
+                "signature": None, "explorer_url": None,
+                "network": network,
+                "error": str(e), "memo": memo}

@@ -22,7 +22,8 @@ def luhn_check(id_number: str) -> tuple[bool, str]:
         return False, f"Checksum invalid — possible forged ID"
     try:
         yy, mm, dd = int(id_number[:2]), int(id_number[2:4]), int(id_number[4:6])
-        year = 1900 + yy if yy >= 24 else 2000 + yy
+        current_year_yy = datetime.now().year % 100
+        year = 1900 + yy if yy > current_year_yy else 2000 + yy
         dob = datetime(year, mm, dd)
         age = (datetime.now() - dob).days // 365
         if age < 18 or age > 80:
@@ -82,3 +83,31 @@ def validate_weight(weight: float) -> tuple[str, str]:
     if weight > 48000:
         return "WARN", f"{weight:,.0f} kg — secondary weigh-bridge check advised"
     return "PASS", f"{weight:,.0f} kg within legal limits"
+
+
+def validate_step1_required(
+    declaration: str,
+    vehicle_reg: str,
+    driver_id: str,
+    permit_no: str,
+    weight_kg: float,
+    dest_country: str,
+) -> list[str]:
+    """Required-field gate for Step 1's Next button. A driver ID that fails
+    its Luhn checksum is deliberately allowed through here — that's an
+    audit-time fraud signal, not a form error — only its format is checked."""
+    errors = []
+    if not declaration.strip():
+        errors.append("Cargo declaration is required.")
+    if not vehicle_reg.strip():
+        errors.append("Vehicle registration is required.")
+    stripped_id = driver_id.strip()
+    if not (stripped_id.isdigit() and len(stripped_id) == 13):
+        errors.append("Driver SA ID Number must be exactly 13 digits.")
+    if not permit_no.strip():
+        errors.append("BMA Permit Number is required.")
+    if weight_kg <= 0:
+        errors.append("Declared weight must be greater than zero.")
+    if not dest_country.strip():
+        errors.append("Destination Country Code is required.")
+    return errors
