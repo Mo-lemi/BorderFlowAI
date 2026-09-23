@@ -19,7 +19,7 @@ def is_configured() -> bool:
 def record_solana(document_hash: str, audit_hash: str, status: str, doc_ref: str, timestamp: str) -> dict:
     """Write clearance decision to Solana as a memo transaction."""
     memo = json.dumps({
-        "app": "BorderFlow", "v": "1.1",
+        "app": "BorderFlow", "v": "1.2",
         "ref": doc_ref, "doc": document_hash, "audit": audit_hash,
         "status": status, "ts": timestamp
     }, separators=(",", ":"))

@@ -13,8 +13,14 @@ from models import ForensicAudit
 from validation import (
     luhn_check, validate_permit, validate_weight, validate_route,
     compute_verdict, exif_present,
-    generate_hash, hash_bytes, extract_exif, build_audio_script,
+    generate_hash, hash_bytes, extract_exif, build_reason, build_audio_script,
 )
+
+
+def _audit_findings_hash(audit: ForensicAudit) -> str:
+    """Fingerprint of Gemini's findings, so the report can be re-verified."""
+    canonical = json.dumps(audit.model_dump(), sort_keys=True, separators=(",", ":"))
+    return hash_bytes(canonical.encode())
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -164,6 +170,11 @@ from services.gemini import call_gemini_audit, is_configured as gemini_configure
 from services.elevenlabs import call_elevenlabs, is_configured as elevenlabs_configured
 from services.solana import record_solana, is_configured as solana_configured
 
+# Not tied to an external service, so read directly here rather than via a
+# services/ module — validation/ must stay free of st.secrets.
+AUDIT_HASH_KEY = st.secrets.get("AUDIT_HASH_KEY", "")
+AUDIT_HASH_KEY_BYTES = AUDIT_HASH_KEY.encode() if AUDIT_HASH_KEY else None
+
 
 # ─────────────────────────────────────────────
 # SESSION STATE
@@ -212,10 +223,12 @@ with st.sidebar:
     gemini_ok = gemini_configured()
     el_ok = elevenlabs_configured()
     sol_ok = solana_configured()
+    audit_key_ok = bool(AUDIT_HASH_KEY)
 
     st.markdown(f"{'✅' if gemini_ok else '❌'} Gemini Vision")
     st.markdown(f"{'✅' if el_ok else '⚠️'} ElevenLabs Audio")
     st.markdown(f"{'✅' if sol_ok else '⚠️'} Solana Ledger")
+    st.markdown(f"{'✅' if audit_key_ok else '⚠️'} Audit hash key")
 
     st.divider()
 
@@ -454,6 +467,8 @@ elif st.session_state.step == 3:
         timestamp = now.isoformat().replace("+00:00", "Z")
         doc_ref = f"BF-{now.strftime('%Y%m%d%H%M%S')}"
 
+        audit_findings_hash = _audit_findings_hash(audit)
+
         hash_input = {
             "declaration": st.session_state.declaration,
             "vehicle_reg": st.session_state.vehicle_reg,
@@ -461,17 +476,25 @@ elif st.session_state.step == 3:
             "permit": st.session_state.permit_no,
             "border": st.session_state.border_post,
             "document_hash": st.session_state.document_hash,
+            "audit_findings_hash": audit_findings_hash,
             "verdict": verdict,
             "ts": timestamp
         }
-        audit_hash = generate_hash(hash_input)
+        audit_hash = generate_hash(hash_input, key=AUDIT_HASH_KEY_BYTES)
         st.session_state.audit_hash = audit_hash
         st.session_state.doc_ref = doc_ref
         st.session_state.timestamp = timestamp
         st.session_state.verdict = verdict
 
         # Generate audio script
-        reason = "; ".join(audit.discrepancies)[:120] if verdict != "CLEARED" else ""
+        reason = build_reason(
+            id_ok=id_ok,
+            permit_ok=permit_ok,
+            weight_severity=weight_severity,
+            route_ok=route_ok,
+            exif_ok=exif_ok,
+            discrepancies=audit.discrepancies,
+        ) if verdict != "CLEARED" else ""
         audio_script = build_audio_script(verdict, doc_ref, reason)
         st.session_state.audio_script = audio_script
 
@@ -653,6 +676,7 @@ elif st.session_state.step == 4:
                     "solana_payload": solana_payload,
                     "ledger": ledger,
                     "audio_script": st.session_state.get("audio_script", ""),
+                    "audit_findings_hash": _audit_findings_hash(audit),
                     "gemini_audit": audit.model_dump(),
                     "rule_checks": {
                         "sa_id": {"passed": id_ok, "detail": id_msg},
