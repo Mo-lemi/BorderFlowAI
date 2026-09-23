@@ -1,11 +1,13 @@
 import hashlib
 import io
-import json
 
 from PIL import Image
 
 from models import ForensicAudit
-from validation.document import generate_hash, hash_bytes, build_reason
+from validation.document import (
+    generate_hash, hash_bytes, audit_findings_hash,
+    build_reason, build_audio_script,
+)
 
 
 def test_hash_bytes_matches_hashlib_sha256():
@@ -81,11 +83,6 @@ def test_same_key_and_input_give_a_stable_hash():
     assert generate_hash(data, key=b"secret") == generate_hash(data, key=b"secret")
 
 
-def _findings_hash(audit: ForensicAudit) -> str:
-    canonical = json.dumps(audit.model_dump(), sort_keys=True, separators=(",", ":"))
-    return hash_bytes(canonical.encode())
-
-
 def test_audit_findings_hash_changes_when_a_finding_changes():
     base_kwargs = dict(
         extracted_data={"field": "value"},
@@ -99,7 +96,7 @@ def test_audit_findings_hash_changes_when_a_finding_changes():
     audit_a = ForensicAudit(**base_kwargs)
     audit_b = ForensicAudit(**{**base_kwargs, "confidence_score": 5})
 
-    assert _findings_hash(audit_a) != _findings_hash(audit_b)
+    assert audit_findings_hash(audit_a) != audit_findings_hash(audit_b)
 
 
 def test_build_reason_includes_exif_reason_when_only_exif_fails():
@@ -116,3 +113,18 @@ def test_build_reason_is_empty_when_everything_passes():
         route_ok=True, exif_ok=True, discrepancies=[],
     )
     assert reason == ""
+
+
+def test_warning_reason_is_capitalized_and_period_terminated():
+    script = build_audio_script(
+        "WARNING", "BF-TEST", "document image has no original metadata"
+    )
+    assert (
+        "flagged for review. Document image has no original metadata. "
+        "Please proceed"
+    ) in script
+
+
+def test_fraud_alert_with_empty_reason_has_no_double_space():
+    script = build_audio_script("FRAUD ALERT", "BF-TEST", "")
+    assert "  " not in script

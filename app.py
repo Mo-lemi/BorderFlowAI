@@ -13,14 +13,8 @@ from models import ForensicAudit
 from validation import (
     luhn_check, validate_permit, validate_weight, validate_route,
     compute_verdict, exif_present,
-    generate_hash, hash_bytes, extract_exif, build_reason, build_audio_script,
+    generate_hash, hash_bytes, audit_findings_hash, extract_exif, build_reason, build_audio_script,
 )
-
-
-def _audit_findings_hash(audit: ForensicAudit) -> str:
-    """Fingerprint of Gemini's findings, so the report can be re-verified."""
-    canonical = json.dumps(audit.model_dump(), sort_keys=True, separators=(",", ":"))
-    return hash_bytes(canonical.encode())
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -174,6 +168,7 @@ from services.solana import record_solana, is_configured as solana_configured
 # services/ module — validation/ must stay free of st.secrets.
 AUDIT_HASH_KEY = st.secrets.get("AUDIT_HASH_KEY", "")
 AUDIT_HASH_KEY_BYTES = AUDIT_HASH_KEY.encode() if AUDIT_HASH_KEY else None
+AUDIT_HASH_ALG = "hmac-sha256" if AUDIT_HASH_KEY_BYTES else "sha256"
 
 
 # ─────────────────────────────────────────────
@@ -194,10 +189,20 @@ defaults = {
     "doc_bytes": None,
     "document_hash": None,
     "audit_hash": None,
+    "audit_hash_input": None,
     "doc_ref": None,
     "timestamp": None,
     "verdict": None,
     "audio_script": "",
+    "id_ok": None,
+    "id_msg": "",
+    "permit_ok": None,
+    "permit_msg": "",
+    "weight_severity": None,
+    "weight_msg": "",
+    "route_ok": None,
+    "route_msg": "",
+    "exif_ok": None,
     "ledger_result": None,
     "audio_bytes": None,
     "image_obj": None,
@@ -447,11 +452,21 @@ elif st.session_state.step == 3:
                 st.stop()
 
         # Rule-based checks feed the verdict alongside Gemini's findings
-        id_ok, _ = luhn_check(st.session_state.driver_id)
-        permit_ok, _ = validate_permit(st.session_state.permit_no, st.session_state.cargo_type)
-        weight_severity, _ = validate_weight(st.session_state.weight_kg)
-        route_ok, _ = validate_route(st.session_state.border_post, st.session_state.dest_country)
+        id_ok, id_msg = luhn_check(st.session_state.driver_id)
+        permit_ok, permit_msg = validate_permit(st.session_state.permit_no, st.session_state.cargo_type)
+        weight_severity, weight_msg = validate_weight(st.session_state.weight_kg)
+        route_ok, route_msg = validate_route(st.session_state.border_post, st.session_state.dest_country)
         exif_ok = exif_present(st.session_state.metadata_str)
+
+        st.session_state.id_ok = id_ok
+        st.session_state.id_msg = id_msg
+        st.session_state.permit_ok = permit_ok
+        st.session_state.permit_msg = permit_msg
+        st.session_state.weight_severity = weight_severity
+        st.session_state.weight_msg = weight_msg
+        st.session_state.route_ok = route_ok
+        st.session_state.route_msg = route_msg
+        st.session_state.exif_ok = exif_ok
 
         verdict = compute_verdict(
             audit=audit,
@@ -467,7 +482,7 @@ elif st.session_state.step == 3:
         timestamp = now.isoformat().replace("+00:00", "Z")
         doc_ref = f"BF-{now.strftime('%Y%m%d%H%M%S')}"
 
-        audit_findings_hash = _audit_findings_hash(audit)
+        findings_hash = audit_findings_hash(audit)
 
         hash_input = {
             "declaration": st.session_state.declaration,
@@ -476,12 +491,13 @@ elif st.session_state.step == 3:
             "permit": st.session_state.permit_no,
             "border": st.session_state.border_post,
             "document_hash": st.session_state.document_hash,
-            "audit_findings_hash": audit_findings_hash,
+            "audit_findings_hash": findings_hash,
             "verdict": verdict,
             "ts": timestamp
         }
         audit_hash = generate_hash(hash_input, key=AUDIT_HASH_KEY_BYTES)
         st.session_state.audit_hash = audit_hash
+        st.session_state.audit_hash_input = hash_input
         st.session_state.doc_ref = doc_ref
         st.session_state.timestamp = timestamp
         st.session_state.verdict = verdict
@@ -503,6 +519,7 @@ elif st.session_state.step == 3:
             ledger = record_solana(
                 document_hash=st.session_state.document_hash,
                 audit_hash=audit_hash,
+                alg=AUDIT_HASH_ALG,
                 status=verdict,
                 doc_ref=doc_ref,
                 timestamp=timestamp,
@@ -610,38 +627,35 @@ elif st.session_state.step == 4:
             st.markdown(audit.regulatory_compliance)
 
     with col2:
-        # Rule-based checks
+        # Rule-based checks — as evaluated in Step 3, not re-run here
         st.markdown("#### ✅ Rule-Based Checks")
 
-        id_ok, id_msg = luhn_check(st.session_state.driver_id)
+        id_ok = st.session_state.get("id_ok")
+        id_msg = st.session_state.get("id_msg", "")
         st.markdown(f"{'✅' if id_ok else '❌'} **SA ID** — {id_msg[:50]}")
 
-        p_ok, p_msg = validate_permit(st.session_state.permit_no, st.session_state.cargo_type)
+        p_ok = st.session_state.get("permit_ok")
+        p_msg = st.session_state.get("permit_msg", "")
         st.markdown(f"{'✅' if p_ok else '❌'} **Permit** — {p_msg[:50]}")
 
-        w_sev, w_msg = validate_weight(st.session_state.weight_kg)
+        w_sev = st.session_state.get("weight_severity")
+        w_msg = st.session_state.get("weight_msg", "")
         w_icon = "✅" if w_sev == "PASS" else ("⚠️" if w_sev == "WARN" else "❌")
         st.markdown(f"{w_icon} **Weight** — {w_msg[:50]}")
 
-        r_ok, r_msg = validate_route(st.session_state.border_post, st.session_state.dest_country)
+        r_ok = st.session_state.get("route_ok")
+        r_msg = st.session_state.get("route_msg", "")
         st.markdown(f"{'✅' if r_ok else '❌'} **Route** — {r_msg[:50]}")
 
-        exif_ok = exif_present(st.session_state.metadata_str)
+        exif_ok = st.session_state.get("exif_ok")
         st.markdown(f"{'✅' if exif_ok else '⚠️'} **EXIF** — {'Original metadata present' if exif_ok else 'No metadata — possible screenshot'}")
 
         st.divider()
 
-        # Solana ledger
+        # Solana ledger — show the memo actually sent, not a separately built payload
         st.markdown("#### ⛓ Solana Ledger")
 
-        solana_payload = {
-            "document_hash": document_hash,
-            "audit_hash": audit_hash,
-            "verification_status": verdict,
-            "doc_ref": doc_ref,
-            "timestamp": timestamp,
-            "flags_raised": sum([not id_ok, not p_ok, w_sev == "FAIL", not r_ok])
-        }
+        solana_payload = json.loads(ledger.get("memo", "{}"))
 
         st.markdown(f"""
         <div class="json-block">{json.dumps(solana_payload, indent=2)}</div>
@@ -667,29 +681,30 @@ elif st.session_state.step == 4:
                 st.session_state[k] = v
             st.rerun()
     with col_b:
-        if st.button("📥 Download Report", use_container_width=True):
-            report = {
-                "borderflow_report": {
-                    "doc_ref": doc_ref,
-                    "timestamp": timestamp,
-                    "verdict": verdict,
-                    "solana_payload": solana_payload,
-                    "ledger": ledger,
-                    "audio_script": st.session_state.get("audio_script", ""),
-                    "audit_findings_hash": _audit_findings_hash(audit),
-                    "gemini_audit": audit.model_dump(),
-                    "rule_checks": {
-                        "sa_id": {"passed": id_ok, "detail": id_msg},
-                        "permit": {"passed": p_ok, "detail": p_msg},
-                        "weight": {"severity": w_sev, "detail": w_msg},
-                        "route": {"passed": r_ok, "detail": r_msg},
-                        "exif": {"original_metadata": exif_ok}
-                    }
+        report = {
+            "borderflow_report": {
+                "doc_ref": doc_ref,
+                "timestamp": timestamp,
+                "verdict": verdict,
+                "solana_payload": solana_payload,
+                "ledger": ledger,
+                "audio_script": st.session_state.get("audio_script", ""),
+                "audit_findings_hash": audit_findings_hash(audit),
+                "audit_hash_input": st.session_state.get("audit_hash_input", {}),
+                "gemini_audit": audit.model_dump(),
+                "rule_checks": {
+                    "sa_id": {"passed": id_ok, "detail": id_msg},
+                    "permit": {"passed": p_ok, "detail": p_msg},
+                    "weight": {"severity": w_sev, "detail": w_msg},
+                    "route": {"passed": r_ok, "detail": r_msg},
+                    "exif": {"original_metadata": exif_ok}
                 }
             }
-            st.download_button(
-                "⬇️ Download JSON",
-                data=json.dumps(report, indent=2),
-                file_name=f"borderflow_{doc_ref}.json",
-                mime="application/json"
-            )
+        }
+        st.download_button(
+            "📥 Download Report",
+            data=json.dumps(report, indent=2),
+            file_name=f"borderflow_{doc_ref}.json",
+            mime="application/json",
+            use_container_width=True,
+        )

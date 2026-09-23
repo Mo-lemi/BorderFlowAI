@@ -6,6 +6,8 @@ import json
 
 from PIL import Image, ExifTags
 
+from models import ForensicAudit
+
 
 def generate_hash(data: dict, key: bytes | None = None) -> str:
     """Hash of the canonical JSON form of `data`. HMAC-SHA256 when `key` is
@@ -21,6 +23,12 @@ def generate_hash(data: dict, key: bytes | None = None) -> str:
 def hash_bytes(data: bytes) -> str:
     """Plain lowercase hex SHA-256, matching `sha256sum` output."""
     return hashlib.sha256(data).hexdigest()
+
+
+def audit_findings_hash(audit: ForensicAudit) -> str:
+    """Fingerprint of Gemini's findings, so the report can be re-verified."""
+    canonical = json.dumps(audit.model_dump(), sort_keys=True, separators=(",", ":"))
+    return hash_bytes(canonical.encode())
 
 
 def extract_exif(img: Image.Image) -> str:
@@ -58,6 +66,16 @@ def build_reason(
     return "; ".join(reasons)[:120]
 
 
+def _format_reason(reason: str) -> str:
+    """Capitalize and period-terminate a reason clause, or "" if there is none."""
+    if not reason:
+        return ""
+    formatted = reason[0].upper() + reason[1:]
+    if not formatted.endswith("."):
+        formatted += "."
+    return formatted
+
+
 def build_audio_script(status: str, doc_ref: str, reason: str = "") -> str:
     if status == "CLEARED":
         return (
@@ -65,15 +83,19 @@ def build_audio_script(status: str, doc_ref: str, reason: str = "") -> str:
             "All forensic checks have passed. "
             "Please proceed to the designated departure lane and retain this confirmation."
         )
-    elif status == "WARNING":
-        return (
-            f"Attention — document {doc_ref} has been flagged for review. "
-            f"{reason} "
-            "Please proceed to the secondary inspection bay."
-        )
+
+    formatted_reason = _format_reason(reason)
+
+    if status == "WARNING":
+        parts = [
+            f"Attention — document {doc_ref} has been flagged for review.",
+            formatted_reason,
+            "Please proceed to the secondary inspection bay.",
+        ]
     else:
-        return (
-            f"Clearance denied for document {doc_ref}. "
-            f"{reason} "
-            "Please park in the inspection zone and await a BMA officer. Do not attempt to proceed."
-        )
+        parts = [
+            f"Clearance denied for document {doc_ref}.",
+            formatted_reason,
+            "Please park in the inspection zone and await a BMA officer. Do not attempt to proceed.",
+        ]
+    return " ".join(part for part in parts if part)
