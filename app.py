@@ -4,44 +4,16 @@ Streamlit app with Gemini Vision, ElevenLabs TTS, and Solana proof-of-cargo.
 """
 
 import streamlit as st
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field, ValidationError
-from typing import Literal
-from PIL import Image, ExifTags
-import httpx
-import hashlib
+from PIL import Image
 import json
-import re
-import base64
-# import asyncio
 from datetime import datetime
 
-# ─────────────────────────────────────────────
-# GEMINI AUDIT SCHEMA
-# ─────────────────────────────────────────────
-
-class ForensicAudit(BaseModel):
-    extracted_data: dict[str, str] = Field(
-        description="Every field legible on the document image, as key/value pairs"
-    )
-    discrepancies: list[str] = Field(
-        description="Each specific mismatch between the declaration and the document. Empty list if none."
-    )
-    forensic_observations: str = Field(
-        description="Document integrity assessment: tampering indicators, metadata analysis"
-    )
-    physical_logic_assessment: str = Field(
-        description="Whether the declared weight is physically plausible for the declared commodity"
-    )
-    regulatory_compliance: str = Field(
-        description="Whether the permit class matches the cargo type"
-    )
-    confidence_score: int = Field(ge=1, le=10)
-    recommended_action: Literal[
-        "PROCEED_TO_LANE", "SECONDARY_INSPECTION", "DETAIN_FOR_INVESTIGATION"
-    ]
-
+from models import ForensicAudit
+from validation import (
+    luhn_check, validate_permit, validate_weight, validate_route,
+    compute_verdict, exif_present,
+    generate_hash, extract_exif, build_audio_script,
+)
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -180,26 +152,16 @@ div[data-testid="stExpander"] {
 
 
 # ─────────────────────────────────────────────
-# SECRETS CHECK
+# SERVICES
 # ─────────────────────────────────────────────
+# Imported here rather than at the top of the file: services.gemini hard-stops
+# the app via st.error()/st.stop() when GEMINI_KEY is missing, and Streamlit
+# requires st.set_page_config() to be the first Streamlit command in the
+# script, so this import must come after it.
 
-required_secrets = ["GEMINI_KEY"]
-optional_secrets = ["ELEVENLABS_KEY", "ELEVENLABS_VOICE_ID", "SOLANA_RPC_URL", "SOLANA_PRIVATE_KEY"]
-
-for s in required_secrets:
-    if s not in st.secrets:
-        st.error(f"❌ Missing `{s}` in `.streamlit/secrets.toml`")
-        st.stop()
-
-GEMINI_KEY = st.secrets["GEMINI_KEY"]
-ELEVENLABS_KEY = st.secrets.get("ELEVENLABS_KEY", "")
-ELEVENLABS_VOICE_ID = st.secrets.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-SOLANA_RPC = st.secrets.get("SOLANA_RPC_URL", "https://api.devnet.solana.com")
-SOLANA_KEY = st.secrets.get("SOLANA_PRIVATE_KEY", "")
-
-client = genai.Client(api_key=GEMINI_KEY)
-
-MEMO_PROGRAM = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+from services.gemini import call_gemini_audit, is_configured as gemini_configured
+from services.elevenlabs import call_elevenlabs, is_configured as elevenlabs_configured
+from services.solana import record_solana, is_configured as solana_configured
 
 
 # ─────────────────────────────────────────────
@@ -230,308 +192,6 @@ for k, v in defaults.items():
 
 
 # ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
-def luhn_check(id_number: str) -> tuple[bool, str]:
-    """SA ID Luhn validation."""
-    id_number = id_number.strip()
-    if not id_number.isdigit() or len(id_number) != 13:
-        return False, "Must be exactly 13 digits"
-    total = 0
-    for i, d in enumerate(id_number[:12]):
-        n = int(d)
-        if i % 2 == 1:
-            n *= 2
-            if n > 9:
-                n -= 9
-        total += n
-    expected = (10 - (total % 10)) % 10
-    if expected != int(id_number[12]):
-        return False, f"Checksum invalid — possible forged ID"
-    try:
-        yy, mm, dd = int(id_number[:2]), int(id_number[2:4]), int(id_number[4:6])
-        year = 1900 + yy if yy >= 24 else 2000 + yy
-        dob = datetime(year, mm, dd)
-        age = (datetime.now() - dob).days // 365
-        if age < 18 or age > 80:
-            return False, f"Embedded DOB implies age {age} — anomalous"
-    except ValueError:
-        return False, "Embedded date of birth is invalid"
-    return True, f"Valid · DOB encoded · Citizenship digit {id_number[10]}"
-
-
-def validate_permit(permit: str, cargo: str) -> tuple[bool, str]:
-    CARGO_CLASS = {
-        "General Freight": "TP", "Electronics": "TP",
-        "Perishables": "PA", "Live Animals": "LA",
-        "Hazardous Materials": "HZ", "Fuel / Petroleum": "FP",
-        "Pharmaceuticals": "PH",
-    }
-    permit = permit.upper().strip()
-    if not re.match(r"^BMA-(TP|HZ|PA|LA|FP|PH)-\d{4}-\d{4,6}$", permit):
-        return False, f"Format invalid — expected BMA-{{CLASS}}-YYYY-XXXXX"
-    permit_year = int(permit.split("-")[2])
-    current_year = datetime.now().year
-    if permit_year < current_year - 1 or permit_year > current_year:
-        return False, f"Permit year {permit_year} is expired or invalid"
-    permit_class = permit.split("-")[1]
-    required = CARGO_CLASS.get(cargo, "TP")
-    if permit_class != required:
-        return False, f"{cargo} requires {required} permit; found {permit_class}"
-    return True, f"Valid · Class {permit_class} · Year {permit_year}"
-
-
-BORDER_COUNTRIES = {
-    "Beit Bridge": ["ZW", "ZM", "MW"],
-    "Lebombo": ["MZ", "SZ"],
-    "Kopfontein": ["BW", "NA"],
-    "Oshoek": ["SZ"],
-    "Ficksburg": ["LS"],
-    "Maseru": ["LS"],
-    "Vioolsdrift": ["NA"],
-}
-
-
-def validate_route(border: str, dest: str) -> tuple[bool, str]:
-    for b, countries in BORDER_COUNTRIES.items():
-        if b.lower() in border.lower():
-            if dest.upper() in countries:
-                return True, f"{border} is valid for {dest}"
-            return False, f"{border} does not serve {dest}"
-    return True, "Route cross-check passed"
-
-
-def validate_weight(weight: float) -> tuple[str, str]:
-    """Returns severity, message."""
-    if weight <= 0:
-        return "FAIL", "Declared weight is zero"
-    if weight > 56000:
-        return "FAIL", f"{weight:,.0f} kg exceeds 56,000 kg national GVM limit"
-    if weight > 48000:
-        return "WARN", f"{weight:,.0f} kg — secondary weigh-bridge check advised"
-    return "PASS", f"{weight:,.0f} kg within legal limits"
-
-
-def compute_verdict(
-    audit: ForensicAudit,
-    id_ok: bool,
-    permit_ok: bool,
-    weight_severity: str,   # "PASS" | "WARN" | "FAIL"
-    route_ok: bool,
-    exif_ok: bool,
-) -> str:
-    """Returns 'CLEARED', 'WARNING', or 'FRAUD ALERT'. This function — not
-    Gemini — owns the verdict."""
-    if (
-        not id_ok
-        or (len(audit.discrepancies) > 0 and audit.confidence_score <= 4)
-        or audit.recommended_action == "DETAIN_FOR_INVESTIGATION"
-        or weight_severity == "FAIL"
-    ):
-        return "FRAUD ALERT"
-
-    if (
-        len(audit.discrepancies) > 0
-        or not permit_ok
-        or not route_ok
-        or not exif_ok
-        or weight_severity == "WARN"
-        or audit.recommended_action == "SECONDARY_INSPECTION"
-        or audit.confidence_score <= 6
-    ):
-        return "WARNING"
-
-    return "CLEARED"
-
-
-def generate_hash(data: dict) -> str:
-    raw = json.dumps(data, sort_keys=True)
-    return "0x" + hashlib.sha256(raw.encode()).hexdigest().upper()
-
-
-def extract_exif(img: Image.Image) -> str:
-    exif = img.getexif()
-    if not exif:
-        return "No EXIF metadata found — possible screenshot or synthetic image"
-    readable = {ExifTags.TAGS.get(t, t): v for t, v in exif.items() if t in ExifTags.TAGS}
-    return json.dumps(readable, default=str)[:800]
-
-
-def exif_present(metadata_str: str) -> bool:
-    return "No EXIF" not in metadata_str
-
-
-def build_audio_script(status: str, doc_ref: str, reason: str = "") -> str:
-    if status == "CLEARED":
-        return (
-            f"Clearance approved for document {doc_ref}. "
-            "All forensic checks have passed. "
-            "Please proceed to the designated departure lane and retain this confirmation."
-        )
-    elif status == "WARNING":
-        return (
-            f"Attention — document {doc_ref} has been flagged for review. "
-            f"{reason} "
-            "Please proceed to the secondary inspection bay."
-        )
-    else:
-        return (
-            f"Clearance denied for document {doc_ref}. "
-            f"{reason} "
-            "Please park in the inspection zone and await a BMA officer. Do not attempt to proceed."
-        )
-
-
-# ─────────────────────────────────────────────
-# API INTEGRATIONS
-# ─────────────────────────────────────────────
-
-def call_gemini_audit(declaration: str, image: Image.Image, metadata: str,
-                      vehicle_reg: str, border: str, cargo: str,
-                      weight: float, permit: str, dest: str) -> ForensicAudit:
-    """Full multimodal forensic audit via Gemini Vision."""
-    prompt = f"""ACT AS: A South African BMA Forensic Customs Auditor.
-
-DRIVER DECLARATION: {declaration}
-VEHICLE REGISTRATION: {vehicle_reg}
-BORDER POST: {border}
-DECLARED CARGO: {cargo}
-DECLARED WEIGHT: {weight} kg
-PERMIT NUMBER: {permit}
-DESTINATION: {dest}
-IMAGE EXIF METADATA: {metadata}
-
-YOUR FORENSIC TASK — analyze the uploaded manifest/document image and:
-
-1. OCR ALL TEXT from the document image. Extract every number, name, date, and field.
-2. CROSS-REFERENCE: Compare the extracted document data against every declared field above.
-   Flag mismatches in: commodity type, weight, consignee, origin/destination, permit number, registration.
-3. PHYSICAL LOGIC CHECK: Is the declared weight physically plausible for this commodity?
-   (e.g., 24 tons of flowers is implausible; 24 tons of steel beams is plausible)
-4. FORENSIC IMAGE CHECK: Assess the document for signs of tampering:
-   - Font inconsistencies or pixel artifacts around text
-   - Missing official stamps or watermarks
-   - EXIF metadata anomalies (stripped metadata suggests screenshot/synthetic)
-   - Mismatched ink colors or printing inconsistencies
-5. REGULATORY CHECK: Does the permit class match the cargo type under SARS/BMA 2024 rules?
-"""
-    response = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=[prompt, image],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ForensicAudit,
-        ),
-    )
-    try:
-        return ForensicAudit.model_validate_json(response.text)
-    except ValidationError as e:
-        raise RuntimeError("Gemini returned malformed audit data") from e
-
-
-def call_elevenlabs(script: str) -> bytes | None:
-    """Generate MP3 audio from clearance script."""
-    if not ELEVENLABS_KEY:
-        return None
-    try:
-        r = httpx.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            json={
-                "text": script,
-                "model_id": "eleven_multilingual_v2",
-                "voice_settings": {
-                    "stability": 0.75,
-                    "similarity_boost": 0.85,
-                    "style": 0.2,
-                    "use_speaker_boost": True
-                }
-            },
-            headers={
-                "xi-api-key": ELEVENLABS_KEY,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg"
-            },
-            timeout=30.0
-        )
-        r.raise_for_status()
-        return r.content
-    except Exception as e:
-        st.warning(f"ElevenLabs error: {e}")
-        return None
-
-
-def record_solana(doc_hash: str, status: str, doc_ref: str, timestamp: str) -> dict:
-    """Write clearance decision to Solana as a memo transaction."""
-    memo = json.dumps({
-        "app": "BorderFlow", "v": "1.0",
-        "ref": doc_ref, "hash": doc_hash,
-        "status": status, "ts": timestamp
-    }, separators=(",", ":"))
-
-    if not SOLANA_KEY:
-        fake_sig = "BF" + doc_hash[2:18] + "DevnetDemo"
-        return {
-            "success": False, "simulated": True,
-            "signature": fake_sig,
-            "explorer_url": f"https://explorer.solana.com/tx/{fake_sig}?cluster=devnet",
-            "memo": memo, "note": "Set SOLANA_PRIVATE_KEY in secrets.toml for real on-chain recording"
-        }
-
-    try:
-        from solders.keypair import Keypair
-        from solders.transaction import Transaction
-        from solders.instruction import Instruction, AccountMeta
-        from solders.pubkey import Pubkey
-        from solders.hash import Hash
-        from solders.message import Message
-
-        # Get latest blockhash
-        bh_resp = httpx.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getLatestBlockhash",
-            "params": [{"commitment": "finalized"}]
-        }, timeout=15.0)
-        blockhash = bh_resp.json()["result"]["value"]["blockhash"]
-
-        kp = Keypair.from_base58_string(SOLANA_KEY)
-        memo_program = Pubkey.from_string(MEMO_PROGRAM)
-        instruction = Instruction(
-            program_id=memo_program,
-            accounts=[AccountMeta(pubkey=kp.pubkey(), is_signer=True, is_writable=False)],
-            data=memo.encode("utf-8")
-        )
-        msg = Message.new_with_blockhash([instruction], kp.pubkey(), Hash.from_string(blockhash))
-        tx = Transaction.new_unsigned(msg)
-        tx.sign([kp], Hash.from_string(blockhash))
-
-        send_resp = httpx.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "sendTransaction",
-            "params": [base64.b64encode(bytes(tx)).decode(), {"encoding": "base64"}]
-        }, timeout=15.0)
-        result = send_resp.json()
-
-        if "error" in result:
-            raise Exception(result["error"]["message"])
-
-        sig = result["result"]
-        cluster = "" if "mainnet" in SOLANA_RPC else "?cluster=devnet"
-        return {
-            "success": True, "simulated": False,
-            "signature": sig,
-            "explorer_url": f"https://explorer.solana.com/tx/{sig}{cluster}",
-            "memo": memo
-        }
-
-    except ImportError:
-        return {"success": False, "simulated": True,
-                "error": "Run: pip install solders", "memo": memo}
-    except Exception as e:
-        return {"success": False, "simulated": True, "error": str(e), "memo": memo}
-
-
-# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 
@@ -542,9 +202,9 @@ with st.sidebar:
 
     st.markdown("**Integration Status**")
 
-    gemini_ok = bool(GEMINI_KEY)
-    el_ok = bool(ELEVENLABS_KEY)
-    sol_ok = bool(SOLANA_KEY)
+    gemini_ok = gemini_configured()
+    el_ok = elevenlabs_configured()
+    sol_ok = solana_configured()
 
     st.markdown(f"{'✅' if gemini_ok else '❌'} Gemini Vision")
     st.markdown(f"{'✅' if el_ok else '⚠️'} ElevenLabs Audio")
@@ -861,7 +521,7 @@ elif st.session_state.step == 4:
         st.caption(f"*\"{st.session_state.get('audio_script', '')}\"*")
     else:
         st.caption(f"*\"{st.session_state.get('audio_script', '')}\"*")
-        if not ELEVENLABS_KEY:
+        if not elevenlabs_configured():
             st.info("💡 Add `ELEVENLABS_KEY` to secrets.toml to enable live audio playback")
 
     st.divider()

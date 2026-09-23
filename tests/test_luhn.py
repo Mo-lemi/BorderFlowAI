@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from app import luhn_check
+from validation.rules import luhn_check
 
 
 def _find_check_digit(base12: str) -> str:

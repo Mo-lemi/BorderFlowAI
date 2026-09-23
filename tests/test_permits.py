@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from app import validate_permit
+from validation.rules import validate_permit
 
 CURRENT_YEAR = datetime.now().year
 

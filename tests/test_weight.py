@@ -1,4 +1,4 @@
-from app import validate_weight
+from validation.rules import validate_weight
 
 
 def test_typical_legal_weight_passes():

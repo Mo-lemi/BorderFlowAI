@@ -1,4 +1,5 @@
-from app import ForensicAudit, compute_verdict, exif_present
+from models import ForensicAudit
+from validation.verdict import compute_verdict, exif_present
 
 
 def _audit(discrepancies=None, confidence_score=9, recommended_action="PROCEED_TO_LANE"):

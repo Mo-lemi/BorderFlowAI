@@ -1,4 +1,4 @@
-from app import validate_route
+from validation.rules import validate_route
 
 
 def test_known_border_with_allowed_destination():
