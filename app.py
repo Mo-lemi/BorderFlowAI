@@ -5,14 +5,15 @@ Streamlit app with Gemini Vision, ElevenLabs TTS, and Solana proof-of-cargo.
 
 import streamlit as st
 from PIL import Image
+import io
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from models import ForensicAudit
 from validation import (
     luhn_check, validate_permit, validate_weight, validate_route,
     compute_verdict, exif_present,
-    generate_hash, extract_exif, build_audio_script,
+    generate_hash, hash_bytes, extract_exif, build_audio_script,
 )
 
 # ─────────────────────────────────────────────
@@ -179,7 +180,13 @@ defaults = {
     "weight_kg": 0.0,
     "dest_country": "ZW",
     "audit_result": None,
-    "doc_hash": None,
+    "doc_bytes": None,
+    "document_hash": None,
+    "audit_hash": None,
+    "doc_ref": None,
+    "timestamp": None,
+    "verdict": None,
+    "audio_script": "",
     "ledger_result": None,
     "audio_bytes": None,
     "image_obj": None,
@@ -362,11 +369,16 @@ elif st.session_state.step == 2:
         )
 
         if uploaded:
-            image = Image.open(uploaded)
+            doc_bytes = uploaded.getvalue()
+            st.session_state.doc_bytes = doc_bytes
+            st.session_state.document_hash = hash_bytes(doc_bytes)
+
+            image = Image.open(io.BytesIO(doc_bytes))
             st.session_state.image_obj = image
             metadata = extract_exif(image)
             st.session_state.metadata_str = metadata
             st.image(image, caption="Uploaded document", use_container_width=True)
+            st.code(f"SHA-256: {st.session_state.document_hash}", language=None)
 
     with col2:
         if st.session_state.image_obj:
@@ -437,20 +449,23 @@ elif st.session_state.step == 3:
             exif_ok=exif_ok,
         )
 
-        # Build doc hash
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        # Build audit hash — one timestamp source drives both timestamp and doc_ref
+        now = datetime.now(timezone.utc)
+        timestamp = now.isoformat().replace("+00:00", "Z")
+        doc_ref = f"BF-{now.strftime('%Y%m%d%H%M%S')}"
+
         hash_input = {
             "declaration": st.session_state.declaration,
             "vehicle_reg": st.session_state.vehicle_reg,
             "driver_id": st.session_state.driver_id,
             "permit": st.session_state.permit_no,
             "border": st.session_state.border_post,
+            "document_hash": st.session_state.document_hash,
             "verdict": verdict,
             "ts": timestamp
         }
-        doc_hash = generate_hash(hash_input)
-        doc_ref = f"BF-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        st.session_state.doc_hash = doc_hash
+        audit_hash = generate_hash(hash_input)
+        st.session_state.audit_hash = audit_hash
         st.session_state.doc_ref = doc_ref
         st.session_state.timestamp = timestamp
         st.session_state.verdict = verdict
@@ -462,7 +477,13 @@ elif st.session_state.step == 3:
 
         # Record to Solana
         with st.spinner("⛓ Recording to Solana ledger..."):
-            ledger = record_solana(doc_hash, verdict, doc_ref, timestamp)
+            ledger = record_solana(
+                document_hash=st.session_state.document_hash,
+                audit_hash=audit_hash,
+                status=verdict,
+                doc_ref=doc_ref,
+                timestamp=timestamp,
+            )
             st.session_state.ledger_result = ledger
 
         # Generate ElevenLabs audio
@@ -485,7 +506,8 @@ elif st.session_state.step == 3:
 elif st.session_state.step == 4:
     verdict = st.session_state.get("verdict", "CLEARED")
     doc_ref = st.session_state.get("doc_ref", "BF-UNKNOWN")
-    doc_hash = st.session_state.get("doc_hash", "")
+    document_hash = st.session_state.get("document_hash", "")
+    audit_hash = st.session_state.get("audit_hash", "")
     timestamp = st.session_state.get("timestamp", "")
     audit: ForensicAudit = st.session_state.get("audit_result")
     ledger = st.session_state.get("ledger_result", {})
@@ -590,7 +612,8 @@ elif st.session_state.step == 4:
         st.markdown("#### ⛓ Solana Ledger")
 
         solana_payload = {
-            "document_hash": doc_hash,
+            "document_hash": document_hash,
+            "audit_hash": audit_hash,
             "verification_status": verdict,
             "doc_ref": doc_ref,
             "timestamp": timestamp,

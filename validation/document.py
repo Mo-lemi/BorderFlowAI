@@ -11,6 +11,11 @@ def generate_hash(data: dict) -> str:
     return "0x" + hashlib.sha256(raw.encode()).hexdigest().upper()
 
 
+def hash_bytes(data: bytes) -> str:
+    """Plain lowercase hex SHA-256, matching `sha256sum` output."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def extract_exif(img: Image.Image) -> str:
     exif = img.getexif()
     if not exif:

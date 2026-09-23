@@ -16,16 +16,16 @@ def is_configured() -> bool:
     return bool(SOLANA_KEY)
 
 
-def record_solana(doc_hash: str, status: str, doc_ref: str, timestamp: str) -> dict:
+def record_solana(document_hash: str, audit_hash: str, status: str, doc_ref: str, timestamp: str) -> dict:
     """Write clearance decision to Solana as a memo transaction."""
     memo = json.dumps({
-        "app": "BorderFlow", "v": "1.0",
-        "ref": doc_ref, "hash": doc_hash,
+        "app": "BorderFlow", "v": "1.1",
+        "ref": doc_ref, "doc": document_hash, "audit": audit_hash,
         "status": status, "ts": timestamp
     }, separators=(",", ":"))
 
     if not SOLANA_KEY:
-        fake_sig = "BF" + doc_hash[2:18] + "DevnetDemo"
+        fake_sig = "BF" + audit_hash.removeprefix("0x")[:16] + "DevnetDemo"
         return {
             "success": False, "simulated": True,
             "signature": fake_sig,
